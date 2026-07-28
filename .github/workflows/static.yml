@@ -1,0 +1,1391 @@
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import * as XLSX from "xlsx";
+import {
+  Plus, Search, X, Clock, CheckCircle2, AlertCircle, Wrench,
+  FlaskConical, Building2, Hash, Cpu, Calendar, FileText,
+  History, Save, ChevronRight, ClipboardList, ShieldCheck,
+  MapPin, MessageSquare, ArrowRight, HardDrive, LayoutGrid, List, Download, Truck, Trash2, Upload
+} from "lucide-react";
+
+const STORAGE_KEY = "atm_case_tracker_v1";
+
+const MACHINE_TYPES = [
+  "DN200AT",
+  "DN100D",
+  "PC280",
+  "SR7500",
+  "MX8600ST",
+  "RG7",
+  "其他",
+];
+
+const VENDORS = ["三商", "國眾", "迪堡多富"];
+
+const VENDOR_STYLE = {
+  "三商": {
+    badge: "bg-violet-50 text-violet-700 ring-1 ring-inset ring-violet-200",
+    dot: "bg-violet-500",
+    solid: "bg-violet-600",
+  },
+  "國眾": {
+    badge: "bg-cyan-50 text-cyan-700 ring-1 ring-inset ring-cyan-200",
+    dot: "bg-cyan-500",
+    solid: "bg-cyan-600",
+  },
+  "迪堡多富": {
+    badge: "bg-fuchsia-50 text-fuchsia-700 ring-1 ring-inset ring-fuchsia-200",
+    dot: "bg-fuchsia-500",
+    solid: "bg-fuchsia-600",
+  },
+};
+
+const DEFAULT_VENDOR_STYLE = {
+  badge: "bg-slate-100 text-slate-600 ring-1 ring-inset ring-slate-200",
+  dot: "bg-slate-400",
+  solid: "bg-slate-500",
+};
+
+const STATUS = {
+  PENDING: "待處理",
+  IN_REPAIR: "廠商檢修中",
+  TESTING: "測試驗證中",
+  CLOSED: "已結案",
+};
+
+const STATUS_LIST = [STATUS.PENDING, STATUS.IN_REPAIR, STATUS.TESTING, STATUS.CLOSED];
+
+const STATUS_STYLE = {
+  [STATUS.PENDING]: {
+    badge: "bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200",
+    dot: "bg-rose-500",
+    bar: "bg-rose-500",
+    icon: AlertCircle,
+    iconColor: "text-rose-600",
+  },
+  [STATUS.IN_REPAIR]: {
+    badge: "bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200",
+    dot: "bg-amber-500",
+    bar: "bg-amber-500",
+    icon: Wrench,
+    iconColor: "text-amber-600",
+  },
+  [STATUS.TESTING]: {
+    badge: "bg-sky-50 text-sky-700 ring-1 ring-inset ring-sky-200",
+    dot: "bg-sky-500",
+    bar: "bg-sky-500",
+    icon: FlaskConical,
+    iconColor: "text-sky-600",
+  },
+  [STATUS.CLOSED]: {
+    badge: "bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-200",
+    dot: "bg-emerald-500",
+    bar: "bg-emerald-500",
+    icon: CheckCircle2,
+    iconColor: "text-emerald-600",
+  },
+};
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function nowLocalDatetime() {
+  const d = new Date();
+  d.setSeconds(0, 0);
+  const off = d.getTimezoneOffset();
+  const local = new Date(d.getTime() - off * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+function fmt(dtStr) {
+  if (!dtStr) return "—";
+  try {
+    const d = new Date(dtStr);
+    if (isNaN(d.getTime())) return dtStr;
+    return d.toLocaleString("zh-TW", {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    });
+  } catch {
+    return dtStr;
+  }
+}
+
+// Formats a stored "YYYY-MM-DDTHH:mm" value as "YYYY-MM-DD HH:MM" — the same plain-text
+// format used by the import template, so an exported file can be edited and re-imported.
+function toImportDateFormat(dtStr) {
+  if (!dtStr) return "";
+  return String(dtStr).replace("T", " ").slice(0, 16);
+}
+
+// ---------- Excel import helpers ----------
+const IMPORT_COLUMNS = {
+  poName: ["郵局局名"],
+  poCode: ["局號(6碼數字)", "局號"],
+  machineNo: ["機號(3碼英數字)", "機號"],
+  machineType: ["機種"],
+  vendor: ["廠商名稱"],
+  issueTime: ["問題發生時間點(YYYY-MM-DD HH:MM)", "問題發生時間點", "問題發生時間"],
+  description: ["問題描述"],
+  vendorAnalysis: ["廠商分析"],
+  resolveTime: ["解決時間/預期解決時間(YYYY-MM-DD HH:MM)", "解決時間/預期解決時間", "解決時間"],
+  solution: ["解決方法"],
+  status: ["目前狀態", "狀態"],
+};
+
+function pickColumn(row, keys) {
+  for (const k of keys) {
+    if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== "") {
+      return row[k];
+    }
+  }
+  return "";
+}
+
+function normalizeCode(val) {
+  if (val === undefined || val === null) return "";
+  let s = String(val).trim();
+  if (/^\d+(\.0+)?$/.test(s)) s = s.replace(/\.0+$/, "");
+  return s;
+}
+
+function padCode(s, len) {
+  if (/^\d+$/.test(s) && s.length < len) return s.padStart(len, "0");
+  return s;
+}
+
+function formatImportedDateTime(val) {
+  if (!val) return "";
+  if (val instanceof Date && !isNaN(val.getTime())) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${val.getFullYear()}-${pad(val.getMonth() + 1)}-${pad(val.getDate())}T${pad(val.getHours())}:${pad(val.getMinutes())}`;
+  }
+  let s = String(val).trim();
+  if (!s) return "";
+  s = s.replace(" ", "T");
+  return s.slice(0, 16);
+}
+
+function parseImportRow(row, rowIndex) {
+  const poName = String(pickColumn(row, IMPORT_COLUMNS.poName)).trim();
+  let poCode = normalizeCode(pickColumn(row, IMPORT_COLUMNS.poCode));
+  poCode = padCode(poCode, 6);
+  let machineNo = String(pickColumn(row, IMPORT_COLUMNS.machineNo)).trim().toUpperCase();
+  const machineType = String(pickColumn(row, IMPORT_COLUMNS.machineType)).trim();
+  const vendor = String(pickColumn(row, IMPORT_COLUMNS.vendor)).trim();
+  const issueTime = formatImportedDateTime(pickColumn(row, IMPORT_COLUMNS.issueTime));
+  const description = String(pickColumn(row, IMPORT_COLUMNS.description)).trim();
+  const vendorAnalysis = String(pickColumn(row, IMPORT_COLUMNS.vendorAnalysis)).trim();
+  const resolveTime = formatImportedDateTime(pickColumn(row, IMPORT_COLUMNS.resolveTime));
+  const solution = String(pickColumn(row, IMPORT_COLUMNS.solution)).trim();
+  let status = String(pickColumn(row, IMPORT_COLUMNS.status)).trim();
+  if (!STATUS_LIST.includes(status)) status = STATUS.PENDING;
+
+  const isBlank = !poName && !poCode && !machineNo && !description;
+
+  const errors = [];
+  if (!poName) errors.push("缺少郵局局名");
+  if (!/^\d{6}$/.test(poCode)) errors.push("局號需為6碼數字");
+  if (!/^[A-Za-z0-9]{3}$/.test(machineNo)) errors.push("機號需為3碼英數字");
+  if (!issueTime) errors.push("缺少問題發生時間");
+  if (!description) errors.push("缺少問題描述");
+
+  return {
+    rowIndex, isBlank,
+    poName, poCode, machineNo, machineType, vendor,
+    issueTime, description, vendorAnalysis, resolveTime, solution, status,
+    errors, valid: errors.length === 0,
+  };
+}
+
+// Composite key used to detect duplicate cases: same post office code + machine number
+// + occurrence time uniquely identifies one anomaly case. When time is missing, fall back
+// to the start of the description as a best-effort fingerprint.
+function buildDedupeKey(c) {
+  const code = (c.poCode || "").trim();
+  const machine = (c.machineNo || "").trim().toUpperCase();
+  const time = (c.issueTime || "").trim();
+  const descFingerprint = (c.description || "").trim().slice(0, 20);
+  return `${code}|${machine}|${time || descFingerprint}`;
+}
+
+function seedData() {
+  const t1 = new Date(); t1.setDate(t1.getDate() - 3);
+  const t2 = new Date(); t2.setDate(t2.getDate() - 1);
+  const t3 = new Date(); t3.setHours(t3.getHours() - 4);
+  return [
+    {
+      id: uid(),
+      poName: "台北中山路郵局",
+      poCode: "100109",
+      machineNo: "1J1",
+      machineType: "DN200AT",
+      vendor: "三商",
+      issueTime: t1.toISOString().slice(0, 16),
+      description: "客戶反映提款後未吐鈔，螢幕停留於處理中畫面，機台自動斷線。",
+      vendorAnalysis: "廠商初步判斷為出鈔模組感測器異常，已派工到場檢測。",
+      resolveTime: "",
+      solution: "",
+      status: STATUS.IN_REPAIR,
+      createdAt: t1.toISOString(),
+      updatedAt: t1.toISOString(),
+      logs: [
+        { id: uid(), time: t1.toISOString(), status: STATUS.PENDING, note: "案件建立" },
+        { id: uid(), time: new Date(t1.getTime() + 3600000).toISOString(), status: STATUS.IN_REPAIR, note: "狀態變更：待處理 → 廠商檢修中；更新廠商分析" },
+      ],
+    },
+    {
+      id: uid(),
+      poName: "台中太平郵局",
+      poCode: "427100",
+      machineNo: "2K3",
+      machineType: "PC280",
+      vendor: "迪堡多富",
+      issueTime: t2.toISOString().slice(0, 16),
+      description: "ATM 交易明細列印不清晰，疑似印表機色帶耗盡。",
+      vendorAnalysis: "已確認為色帶耗盡，備品已送達，預計今日更換完成。",
+      resolveTime: "",
+      solution: "",
+      status: STATUS.TESTING,
+      createdAt: t2.toISOString(),
+      updatedAt: t2.toISOString(),
+      logs: [
+        { id: uid(), time: t2.toISOString(), status: STATUS.PENDING, note: "案件建立" },
+        { id: uid(), time: new Date(t2.getTime() + 1800000).toISOString(), status: STATUS.IN_REPAIR, note: "狀態變更：待處理 → 廠商檢修中" },
+        { id: uid(), time: new Date(t2.getTime() + 5400000).toISOString(), status: STATUS.TESTING, note: "狀態變更：廠商檢修中 → 測試驗證中；更新廠商分析" },
+      ],
+    },
+    {
+      id: uid(),
+      poName: "高雄鳳山郵局",
+      poCode: "830100",
+      machineNo: "3M2",
+      machineType: "SR7500",
+      vendor: "國眾",
+      issueTime: t3.toISOString().slice(0, 16),
+      description: "系統回報讀卡機吞卡異常，客戶卡片無法退出。",
+      vendorAnalysis: "",
+      resolveTime: "",
+      solution: "",
+      status: STATUS.PENDING,
+      createdAt: t3.toISOString(),
+      updatedAt: t3.toISOString(),
+      logs: [
+        { id: uid(), time: t3.toISOString(), status: STATUS.PENDING, note: "案件建立" },
+      ],
+    },
+  ];
+}
+
+function loadCases() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  const seeded = seedData();
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded)); } catch {}
+  return seeded;
+}
+
+function Field({ label, required, error, children, icon: Icon }) {
+  return (
+    <div>
+      <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 mb-1.5">
+        {Icon && <Icon size={13} className="text-slate-400" />}
+        {label}
+        {required && <span className="text-rose-500">*</span>}
+      </label>
+      {children}
+      {error && <p className="mt-1 text-xs text-rose-600">{error}</p>}
+    </div>
+  );
+}
+
+const inputBase =
+  "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 placeholder-slate-400 " +
+  "focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 transition-colors";
+
+function StatusBadge({ status, size = "sm" }) {
+  const s = STATUS_STYLE[status];
+  const Icon = s.icon;
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full font-medium ${s.badge} ${
+        size === "sm" ? "px-2.5 py-1 text-xs" : "px-3 py-1.5 text-sm"
+      }`}
+    >
+      <Icon size={size === "sm" ? 12 : 14} />
+      {status}
+    </span>
+  );
+}
+
+function VendorBadge({ vendor, size = "sm" }) {
+  if (!vendor) return <span className="text-slate-400 text-xs">—</span>;
+  const v = VENDOR_STYLE[vendor] || DEFAULT_VENDOR_STYLE;
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full font-medium ${v.badge} ${
+        size === "sm" ? "px-2.5 py-1 text-xs" : "px-3 py-1.5 text-sm"
+      }`}
+    >
+      <Truck size={size === "sm" ? 12 : 14} />
+      {vendor}
+    </span>
+  );
+}
+
+function CaseForm({ initial, onCancel, onSubmit, submitLabel }) {
+  const [form, setForm] = useState(
+    initial || {
+      poName: "",
+      poCode: "",
+      machineNo: "",
+      machineType: MACHINE_TYPES[0],
+      vendor: VENDORS[0],
+      issueTime: nowLocalDatetime(),
+      description: "",
+      vendorAnalysis: "",
+      resolveTime: "",
+      solution: "",
+      status: STATUS.PENDING,
+    }
+  );
+  const [errors, setErrors] = useState({});
+
+  const update = (key, val) => setForm((f) => ({ ...f, [key]: val }));
+
+  const validate = () => {
+    const e = {};
+    if (!form.poName.trim()) e.poName = "請輸入郵局局名";
+    if (!/^\d{6}$/.test(form.poCode)) e.poCode = "局號須為 6 碼數字";
+    if (!/^[A-Za-z0-9]{3}$/.test(form.machineNo)) e.machineNo = "機號須為 3 碼英數字（例如 1J1）";
+    if (!form.vendor) e.vendor = "請選擇廠商名稱";
+    if (!form.issueTime) e.issueTime = "請選擇問題發生時間";
+    if (!form.description.trim()) e.description = "請輸入問題描述";
+    setErrors(e);
+    return Object.keys(e).length === 0;
+  };
+
+  const handleSubmit = () => {
+    if (!validate()) return;
+    onSubmit({ ...form, machineNo: form.machineNo.toUpperCase() });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <Field label="郵局局名" required error={errors.poName} icon={Building2}>
+          <input
+            className={inputBase}
+            placeholder="例如：台北中山路郵局"
+            value={form.poName}
+            onChange={(e) => update("poName", e.target.value)}
+          />
+        </Field>
+        <Field label="局號" required error={errors.poCode} icon={Hash}>
+          <input
+            className={inputBase}
+            placeholder="6 碼數字"
+            maxLength={6}
+            value={form.poCode}
+            onChange={(e) => update("poCode", e.target.value.replace(/\D/g, "").slice(0, 6))}
+          />
+        </Field>
+        <Field label="機號" required error={errors.machineNo} icon={Cpu}>
+          <input
+            className={inputBase}
+            placeholder="例如：1J1"
+            maxLength={3}
+            value={form.machineNo}
+            onChange={(e) => update("machineNo", e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3))}
+          />
+        </Field>
+        <Field label="機種" required error={errors.machineType} icon={HardDrive}>
+          <select
+            className={inputBase}
+            value={form.machineType}
+            onChange={(e) => update("machineType", e.target.value)}
+          >
+            {MACHINE_TYPES.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="廠商名稱" required error={errors.vendor} icon={Truck}>
+          <div className="flex items-center gap-2">
+            <select
+              className={inputBase}
+              value={form.vendor}
+              onChange={(e) => update("vendor", e.target.value)}
+            >
+              {VENDORS.map((v) => (
+                <option key={v} value={v}>{v}</option>
+              ))}
+            </select>
+            <span className={`shrink-0 w-3 h-3 rounded-full ${(VENDOR_STYLE[form.vendor] || DEFAULT_VENDOR_STYLE).dot}`} />
+          </div>
+        </Field>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <Field label="問題發生時間點" required error={errors.issueTime} icon={Calendar}>
+          <input
+            type="datetime-local"
+            className={inputBase}
+            value={form.issueTime}
+            onChange={(e) => update("issueTime", e.target.value)}
+          />
+        </Field>
+        <Field label="目前狀態" icon={ShieldCheck}>
+          <select
+            className={inputBase}
+            value={form.status}
+            onChange={(e) => update("status", e.target.value)}
+          >
+            {STATUS_LIST.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+        </Field>
+      </div>
+
+      <Field label="問題描述" required error={errors.description} icon={FileText}>
+        <textarea
+          className={inputBase + " min-h-[80px] resize-y"}
+          placeholder="描述客戶反映或系統偵測到的異常現象"
+          value={form.description}
+          onChange={(e) => update("description", e.target.value)}
+        />
+      </Field>
+
+      <Field label="廠商分析" icon={ClipboardList}>
+        <textarea
+          className={inputBase + " min-h-[70px] resize-y"}
+          placeholder="（選填）廠商初步或後續分析內容"
+          value={form.vendorAnalysis}
+          onChange={(e) => update("vendorAnalysis", e.target.value)}
+        />
+      </Field>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <Field label="解決時間／預期解決時間" icon={Clock}>
+          <input
+            type="datetime-local"
+            className={inputBase}
+            value={form.resolveTime}
+            onChange={(e) => update("resolveTime", e.target.value)}
+          />
+        </Field>
+      </div>
+
+      <Field label="解決方法" icon={Wrench}>
+        <textarea
+          className={inputBase + " min-h-[70px] resize-y"}
+          placeholder="（選填）已採取或預計採取的解決方式"
+          value={form.solution}
+          onChange={(e) => update("solution", e.target.value)}
+        />
+      </Field>
+
+      <div className="flex items-center justify-end gap-3 pt-2 border-t border-slate-100">
+        <button
+          onClick={onCancel}
+          className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors"
+        >
+          取消
+        </button>
+        <button
+          onClick={handleSubmit}
+          className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg shadow-sm transition-colors"
+        >
+          <Save size={15} />
+          {submitLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Modal({ title, subtitle, onClose, children, wide, headerActions }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm overflow-y-auto">
+      <div
+        className={`bg-white w-full ${wide ? "sm:max-w-3xl" : "sm:max-w-xl"} sm:rounded-2xl shadow-2xl min-h-full sm:min-h-0 sm:my-8`}
+      >
+        <div className="sticky top-0 z-10 flex items-start justify-between gap-4 px-5 sm:px-6 py-4 border-b border-slate-200 bg-white sm:rounded-t-2xl">
+          <div>
+            <h2 className="text-base font-bold text-slate-800">{title}</h2>
+            {subtitle && <p className="text-xs text-slate-500 mt-0.5">{subtitle}</p>}
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {headerActions}
+            <button
+              onClick={onClose}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+        <div className="px-5 sm:px-6 py-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function CaseDetail({ item, onClose, onSave }) {
+  const [edit, setEdit] = useState({
+    vendorAnalysis: item.vendorAnalysis,
+    solution: item.solution,
+    resolveTime: item.resolveTime,
+    status: item.status,
+  });
+  const [manualNote, setManualNote] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  const hasChanges =
+    edit.vendorAnalysis !== item.vendorAnalysis ||
+    edit.solution !== item.solution ||
+    edit.resolveTime !== item.resolveTime ||
+    edit.status !== item.status ||
+    manualNote.trim().length > 0;
+
+  const handleSave = () => {
+    const changeDescriptions = [];
+    if (edit.status !== item.status) {
+      changeDescriptions.push(`狀態變更：${item.status} → ${edit.status}`);
+    }
+    if (edit.vendorAnalysis !== item.vendorAnalysis) {
+      changeDescriptions.push("更新廠商分析");
+    }
+    if (edit.solution !== item.solution) {
+      changeDescriptions.push("更新解決方法");
+    }
+    if (edit.resolveTime !== item.resolveTime) {
+      changeDescriptions.push(`更新解決時間為 ${edit.resolveTime ? fmt(edit.resolveTime) : "（清空）"}`);
+    }
+    if (!changeDescriptions.length && !manualNote.trim()) return;
+
+    let note = changeDescriptions.join("；");
+    if (manualNote.trim()) {
+      note = note ? `${note}。備註：${manualNote.trim()}` : manualNote.trim();
+    }
+
+    const newLog = {
+      id: uid(),
+      time: new Date().toISOString(),
+      status: edit.status,
+      note,
+    };
+
+    const updated = {
+      ...item,
+      vendorAnalysis: edit.vendorAnalysis,
+      solution: edit.solution,
+      resolveTime: edit.resolveTime,
+      status: edit.status,
+      updatedAt: new Date().toISOString(),
+      logs: [...item.logs, newLog],
+    };
+
+    onSave(updated);
+    setManualNote("");
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1800);
+  };
+
+  const sortedLogs = [...item.logs].sort((a, b) => new Date(b.time) - new Date(a.time));
+  const s = STATUS_STYLE[item.status];
+
+  return (
+    <div className="space-y-6">
+      {/* Read-only summary */}
+      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
+          <div>
+            <p className="text-xs text-slate-500 flex items-center gap-1"><Building2 size={12} />郵局局名</p>
+            <p className="font-semibold text-slate-800 mt-0.5">{item.poName}</p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-500 flex items-center gap-1"><Hash size={12} />局號</p>
+            <p className="font-semibold text-slate-800 mt-0.5">{item.poCode}</p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-500 flex items-center gap-1"><Cpu size={12} />機號</p>
+            <p className="font-semibold text-slate-800 mt-0.5">{item.machineNo}</p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-500 flex items-center gap-1"><HardDrive size={12} />機種</p>
+            <p className="font-semibold text-slate-800 mt-0.5">{item.machineType || "—"}</p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-500 flex items-center gap-1"><Truck size={12} />廠商名稱</p>
+            <div className="mt-1"><VendorBadge vendor={item.vendor} /></div>
+          </div>
+          <div>
+            <p className="text-xs text-slate-500 flex items-center gap-1"><Calendar size={12} />問題發生時間</p>
+            <p className="font-semibold text-slate-800 mt-0.5">{fmt(item.issueTime)}</p>
+          </div>
+          <div className="sm:col-span-3">
+            <p className="text-xs text-slate-500 flex items-center gap-1"><ShieldCheck size={12} />目前狀態</p>
+            <div className="mt-1"><StatusBadge status={item.status} /></div>
+          </div>
+        </div>
+        <div className="mt-3 pt-3 border-t border-slate-200">
+          <p className="text-xs text-slate-500 flex items-center gap-1 mb-1"><FileText size={12} />問題描述</p>
+          <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{item.description}</p>
+        </div>
+      </div>
+
+      {/* Editable section */}
+      <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-4 space-y-4">
+        <p className="text-xs font-semibold text-blue-800 flex items-center gap-1.5">
+          <ClipboardList size={14} />
+          案件更新（儲存後將自動寫入處理軌跡）
+        </p>
+
+        <Field label="廠商分析" icon={ClipboardList}>
+          <textarea
+            className={inputBase + " min-h-[70px] resize-y bg-white"}
+            value={edit.vendorAnalysis}
+            onChange={(e) => setEdit((f) => ({ ...f, vendorAnalysis: e.target.value }))}
+          />
+        </Field>
+
+        <Field label="解決方法" icon={Wrench}>
+          <textarea
+            className={inputBase + " min-h-[70px] resize-y bg-white"}
+            value={edit.solution}
+            onChange={(e) => setEdit((f) => ({ ...f, solution: e.target.value }))}
+          />
+        </Field>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="解決時間／預期解決時間" icon={Clock}>
+            <input
+              type="datetime-local"
+              className={inputBase + " bg-white"}
+              value={edit.resolveTime}
+              onChange={(e) => setEdit((f) => ({ ...f, resolveTime: e.target.value }))}
+            />
+          </Field>
+          <Field label="目前狀態" icon={ShieldCheck}>
+            <select
+              className={inputBase + " bg-white"}
+              value={edit.status}
+              onChange={(e) => setEdit((f) => ({ ...f, status: e.target.value }))}
+            >
+              {STATUS_LIST.map((st) => (
+                <option key={st} value={st}>{st}</option>
+              ))}
+            </select>
+          </Field>
+        </div>
+
+        <Field label="更新備註（選填）" icon={MessageSquare}>
+          <input
+            className={inputBase + " bg-white"}
+            placeholder="例如：已致電廠商確認到場時間"
+            value={manualNote}
+            onChange={(e) => setManualNote(e.target.value)}
+          />
+        </Field>
+
+        <div className="flex items-center justify-end gap-3">
+          {saved && <span className="text-xs font-medium text-emerald-600">已儲存並記錄軌跡</span>}
+          <button
+            disabled={!hasChanges}
+            onClick={handleSave}
+            className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold rounded-lg shadow-sm transition-colors ${
+              hasChanges
+                ? "text-white bg-blue-700 hover:bg-blue-800"
+                : "text-slate-400 bg-slate-200 cursor-not-allowed"
+            }`}
+          >
+            <Save size={15} />
+            儲存並記錄軌跡
+          </button>
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <div>
+        <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5 mb-3">
+          <History size={14} />
+          處理軌跡（{sortedLogs.length} 筆，新到舊）
+        </p>
+        <div className="relative pl-5">
+          <div className="absolute left-[7px] top-1 bottom-1 w-px bg-slate-200" />
+          <div className="space-y-4">
+            {sortedLogs.map((log, idx) => {
+              const ls = STATUS_STYLE[log.status] || STATUS_STYLE[STATUS.PENDING];
+              return (
+                <div key={log.id} className="relative">
+                  <span
+                    className={`absolute -left-5 top-1 w-3.5 h-3.5 rounded-full ring-4 ring-white ${ls.dot}`}
+                  />
+                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-xs font-medium text-slate-500">{fmt(log.time)}</span>
+                      <StatusBadge status={log.status} />
+                    </div>
+                    <p className="text-sm text-slate-700 mt-1.5 leading-relaxed">{log.note}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, count, status }) {
+  const s = STATUS_STYLE[status];
+  const Icon = s.icon;
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3.5 shadow-sm">
+      <div className={`flex items-center justify-center w-9 h-9 rounded-lg ${s.badge}`}>
+        <Icon size={17} className={s.iconColor} />
+      </div>
+      <div>
+        <p className="text-xl font-bold text-slate-800 leading-tight">{count}</p>
+        <p className="text-xs text-slate-500">{label}</p>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [cases, setCases] = useState([]);
+  const [showAdd, setShowAdd] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("全部");
+  const [vendorFilter, setVendorFilter] = useState("全部");
+  const [viewMode, setViewMode] = useState("table");
+  const [deleteTargetId, setDeleteTargetId] = useState(null);
+  const [importRows, setImportRows] = useState(null);
+  const [importError, setImportError] = useState("");
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    setCases(loadCases());
+  }, []);
+
+  useEffect(() => {
+    if (cases.length >= 0) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cases));
+      } catch {}
+    }
+  }, [cases]);
+
+  const handleAdd = (form) => {
+    const now = new Date().toISOString();
+    const newCase = {
+      id: uid(),
+      ...form,
+      createdAt: now,
+      updatedAt: now,
+      logs: [{ id: uid(), time: now, status: form.status, note: "案件建立" }],
+    };
+    setCases((prev) => [newCase, ...prev]);
+    setShowAdd(false);
+    setSelectedId(newCase.id);
+  };
+
+  const handleUpdate = (updated) => {
+    setCases((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+  };
+
+  const handleDelete = (id) => {
+    setCases((prev) => prev.filter((c) => c.id !== id));
+    if (selectedId === id) setSelectedId(null);
+    setDeleteTargetId(null);
+  };
+
+  const handleFileSelected = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setImportError("");
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: "array", cellDates: true });
+      const sheetName = workbook.SheetNames.includes("案件資料")
+        ? "案件資料"
+        : workbook.SheetNames[workbook.SheetNames.length - 1];
+      const sheet = workbook.Sheets[sheetName];
+      const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+      const parsed = json
+        .map((row, idx) => parseImportRow(row, idx + 2))
+        .filter((r) => !r.isBlank);
+      if (!parsed.length) {
+        setImportError("在檔案中找不到可匯入的資料列，請確認格式是否與範本一致。");
+        return;
+      }
+
+      // Duplicate detection: skip rows that match a case already in the system
+      // (by 局號+機號+發生時間), and also catch repeats within this same file.
+      const existingKeys = new Set(cases.map(buildDedupeKey));
+      const seenInBatch = new Set();
+      const withDupeFlags = parsed.map((r) => {
+        const key = buildDedupeKey(r);
+        let duplicateOf = null;
+        if (existingKeys.has(key)) duplicateOf = "system";
+        else if (seenInBatch.has(key)) duplicateOf = "batch";
+        if (r.valid) seenInBatch.add(key);
+        return { ...r, duplicateOf, include: r.valid && !duplicateOf };
+      });
+
+      setImportRows(withDupeFlags);
+    } catch (err) {
+      setImportError("讀取檔案失敗，請確認檔案為 .xlsx 格式且未損毀。");
+    }
+  };
+
+  const toggleImportRowInclude = (rowIndex) => {
+    setImportRows((prev) =>
+      prev.map((r) => (r.rowIndex === rowIndex ? { ...r, include: !r.include } : r))
+    );
+  };
+
+  const handleConfirmImport = () => {
+    if (!importRows) return;
+    const now = new Date().toISOString();
+    const validRows = importRows.filter((r) => r.valid && r.include);
+    const newCases = validRows.map((r) => ({
+      id: uid(),
+      poName: r.poName,
+      poCode: r.poCode,
+      machineNo: r.machineNo,
+      machineType: r.machineType,
+      vendor: r.vendor,
+      issueTime: r.issueTime,
+      description: r.description,
+      vendorAnalysis: r.vendorAnalysis,
+      resolveTime: r.resolveTime,
+      solution: r.solution,
+      status: r.status,
+      createdAt: now,
+      updatedAt: now,
+      logs: [{
+        id: uid(),
+        time: now,
+        status: r.status,
+        note: r.duplicateOf ? "從 Excel 匯入建立案件（使用者確認匯入重複比對項目）" : "從 Excel 匯入建立案件",
+      }],
+    }));
+    setCases((prev) => [...newCases, ...prev]);
+    setImportRows(null);
+  };
+
+  const selected = cases.find((c) => c.id === selectedId) || null;
+  const deleteTarget = cases.find((c) => c.id === deleteTargetId) || null;
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return cases
+      .filter((c) => (statusFilter === "全部" ? true : c.status === statusFilter))
+      .filter((c) => (vendorFilter === "全部" ? true : c.vendor === vendorFilter))
+      .filter((c) =>
+        !q
+          ? true
+          : c.poName.toLowerCase().includes(q) ||
+            c.poCode.includes(q) ||
+            c.machineNo.toLowerCase().includes(q) ||
+            (c.machineType || "").toLowerCase().includes(q) ||
+            (c.vendor || "").toLowerCase().includes(q)
+      )
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  }, [cases, query, statusFilter, vendorFilter]);
+
+  const counts = useMemo(() => {
+    const c = { [STATUS.PENDING]: 0, [STATUS.IN_REPAIR]: 0, [STATUS.TESTING]: 0, [STATUS.CLOSED]: 0 };
+    cases.forEach((item) => { c[item.status] = (c[item.status] || 0) + 1; });
+    return c;
+  }, [cases]);
+
+  const handleExportExcel = () => {
+    if (!filtered.length) return;
+
+    const rows = filtered.map((item) => ({
+      "目前狀態": item.status,
+      "廠商名稱": item.vendor || "",
+      "郵局局名": item.poName,
+      "局號(6碼數字)": item.poCode,
+      "機號(3碼英數字)": item.machineNo,
+      "機種": item.machineType || "",
+      "問題發生時間點(YYYY-MM-DD HH:MM)": toImportDateFormat(item.issueTime),
+      "問題描述": item.description,
+      "廠商分析": item.vendorAnalysis || "",
+      "解決時間/預期解決時間(YYYY-MM-DD HH:MM)": toImportDateFormat(item.resolveTime),
+      "解決方法": item.solution || "",
+      "最後更新時間": fmt(item.updatedAt),
+      "案件建立時間": fmt(item.createdAt),
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    worksheet["!cols"] = [
+      { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 14 }, { wch: 12 }, { wch: 12 },
+      { wch: 22 }, { wch: 34 }, { wch: 30 }, { wch: 22 }, { wch: 30 },
+      { wch: 16 }, { wch: 16 },
+    ];
+    worksheet["!freeze"] = { xSplit: 0, ySplit: 1 };
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "ATM異常案件");
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(workbook, `ATM異常案件一覽表_${stamp}.xlsx`);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100">
+      {/* Header */}
+      <header className="bg-slate-900 text-white">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-5 flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-blue-600/90">
+              <ShieldCheck size={20} />
+            </div>
+            <div>
+              <h1 className="text-lg font-bold tracking-tight">ATM 設備異常追蹤管理系統</h1>
+              <p className="text-xs text-slate-400 mt-0.5">全台 ATM 設備異常案件追蹤與委外廠商修復進度管理</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,.xls"
+              className="hidden"
+              onChange={handleFileSelected}
+            />
+            <button
+              onClick={() => fileInputRef.current && fileInputRef.current.click()}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold bg-slate-700 hover:bg-slate-600 rounded-lg shadow-sm transition-colors"
+            >
+              <Upload size={16} />
+              匯入 Excel
+            </button>
+            <button
+              onClick={() => setShowAdd(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold bg-blue-600 hover:bg-blue-500 rounded-lg shadow-sm transition-colors"
+            >
+              <Plus size={16} />
+              新增案件
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {/* Stats */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <StatCard label="待處理" count={counts[STATUS.PENDING]} status={STATUS.PENDING} />
+          <StatCard label="廠商檢修中" count={counts[STATUS.IN_REPAIR]} status={STATUS.IN_REPAIR} />
+          <StatCard label="測試驗證中" count={counts[STATUS.TESTING]} status={STATUS.TESTING} />
+          <StatCard label="已結案" count={counts[STATUS.CLOSED]} status={STATUS.CLOSED} />
+        </div>
+
+        {/* Filter bar */}
+        <div className="flex flex-col sm:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              className={inputBase + " pl-9"}
+              placeholder="搜尋局名、局號、機號或廠商..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          <select
+            className={inputBase + " sm:w-48"}
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+          >
+            <option value="全部">全部狀態</option>
+            {STATUS_LIST.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          <select
+            className={inputBase + " sm:w-40"}
+            value={vendorFilter}
+            onChange={(e) => setVendorFilter(e.target.value)}
+          >
+            <option value="全部">全部廠商</option>
+            {VENDORS.map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+          <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white p-1 shrink-0">
+            <button
+              onClick={() => setViewMode("table")}
+              title="一覽表檢視"
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                viewMode === "table" ? "bg-blue-700 text-white" : "text-slate-500 hover:bg-slate-100"
+              }`}
+            >
+              <List size={14} />
+              一覽表
+            </button>
+            <button
+              onClick={() => setViewMode("card")}
+              title="卡片檢視"
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                viewMode === "card" ? "bg-blue-700 text-white" : "text-slate-500 hover:bg-slate-100"
+              }`}
+            >
+              <LayoutGrid size={14} />
+              卡片
+            </button>
+          </div>
+          <button
+            onClick={handleExportExcel}
+            disabled={!filtered.length}
+            title="匯出目前篩選結果為 Excel"
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold shrink-0 transition-colors ${
+              filtered.length
+                ? "bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm"
+                : "bg-slate-200 text-slate-400 cursor-not-allowed"
+            }`}
+          >
+            <Download size={14} />
+            匯出 Excel
+          </button>
+        </div>
+
+        {/* Case list */}
+        {filtered.length === 0 ? (
+          <div className="text-center py-16 rounded-xl border border-dashed border-slate-300 bg-white">
+            <ClipboardList size={32} className="mx-auto text-slate-300 mb-3" />
+            <p className="text-sm text-slate-500">目前沒有符合條件的案件</p>
+          </div>
+        ) : viewMode === "table" ? (
+          <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-left">
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">狀態</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">廠商名稱</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">局名</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">局號</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">機號</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">機種</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">問題發生時間</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500">問題描述</th>
+                    <th className="px-4 py-2.5 text-xs font-semibold text-slate-500 whitespace-nowrap">最後更新</th>
+                    <th className="px-4 py-2.5"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((item) => {
+                    const s = STATUS_STYLE[item.status];
+                    return (
+                      <tr
+                        key={item.id}
+                        onClick={() => setSelectedId(item.id)}
+                        className="border-b border-slate-100 last:border-0 hover:bg-blue-50/50 cursor-pointer transition-colors"
+                      >
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${s.iconColor}`}>
+                            <span className={`w-2 h-2 rounded-full ${s.dot}`} />
+                            {item.status}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <VendorBadge vendor={item.vendor} />
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap font-medium text-slate-800">{item.poName}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-slate-500 font-mono text-xs">{item.poCode}</td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span className="inline-flex items-center justify-center px-2 py-0.5 rounded-md bg-slate-800 text-white text-xs font-bold font-mono">
+                            {item.machineNo}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-slate-600">{item.machineType || "—"}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-slate-500">{fmt(item.issueTime)}</td>
+                        <td className="px-4 py-3 text-slate-600 max-w-xs truncate">{item.description}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-slate-400 text-xs">{fmt(item.updatedAt)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDeleteTargetId(item.id);
+                              }}
+                              title="刪除案件"
+                              className="p-1.5 rounded-md text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                            <ChevronRight size={15} className="text-slate-400" />
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filtered.map((item) => {
+              const s = STATUS_STYLE[item.status];
+              return (
+                <div
+                  key={item.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setSelectedId(item.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") setSelectedId(item.id);
+                  }}
+                  className="text-left bg-white rounded-xl border border-slate-200 shadow-sm hover:shadow-md hover:border-blue-300 transition-all overflow-hidden group cursor-pointer"
+                >
+                  <div className={`h-1 ${s.bar}`} />
+                  <div className="p-4">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-slate-800 truncate flex items-center gap-1.5">
+                          <MapPin size={13} className="text-slate-400 shrink-0" />
+                          {item.poName}
+                        </p>
+                        <p className="text-xs text-slate-500 mt-0.5">局號 {item.poCode}</p>
+                      </div>
+                      <div className="shrink-0 flex items-start gap-2">
+                        <div className="flex flex-col items-end gap-1">
+                          <span className="inline-flex items-center justify-center px-2 py-1 rounded-lg bg-slate-800 text-white text-xs font-bold font-mono">
+                            {item.machineNo}
+                          </span>
+                          <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                            <HardDrive size={11} />
+                            {item.machineType || "—"}
+                          </span>
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteTargetId(item.id);
+                          }}
+                          title="刪除案件"
+                          className="p-1 rounded-md text-slate-300 hover:text-rose-600 hover:bg-rose-50 transition-colors opacity-0 group-hover:opacity-100"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-slate-500 mt-3 flex items-center gap-1">
+                      <Calendar size={12} />
+                      {fmt(item.issueTime)}
+                    </p>
+
+                    <p className="text-sm text-slate-600 mt-2 line-clamp-2 leading-relaxed min-h-[2.5rem]">
+                      {item.description}
+                    </p>
+
+                    <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-100 flex-wrap gap-2">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <StatusBadge status={item.status} />
+                        <VendorBadge vendor={item.vendor} />
+                      </div>
+                      <span className="inline-flex items-center gap-0.5 text-xs font-medium text-blue-700 group-hover:gap-1.5 transition-all">
+                        查看詳情 <ChevronRight size={13} />
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </main>
+
+      {importError && (
+        <div className="fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border border-rose-200 bg-white shadow-lg p-4 flex items-start gap-3">
+          <AlertCircle size={18} className="text-rose-600 shrink-0 mt-0.5" />
+          <p className="text-sm text-slate-700 flex-1">{importError}</p>
+          <button
+            onClick={() => setImportError("")}
+            className="text-slate-400 hover:text-slate-600 shrink-0"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {showAdd && (
+        <Modal title="新增異常案件" subtitle="請填寫案件基本資訊" onClose={() => setShowAdd(false)}>
+          <CaseForm
+            onCancel={() => setShowAdd(false)}
+            onSubmit={handleAdd}
+            submitLabel="建立案件"
+          />
+        </Modal>
+      )}
+
+      {selected && (
+        <Modal
+          title={`${selected.poName}（機號 ${selected.machineNo}）`}
+          subtitle={`局號 ${selected.poCode} ・ 案件建立於 ${fmt(selected.createdAt)}`}
+          onClose={() => setSelectedId(null)}
+          wide
+          headerActions={
+            <button
+              onClick={() => setDeleteTargetId(selected.id)}
+              title="刪除案件"
+              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+            >
+              <Trash2 size={18} />
+            </button>
+          }
+        >
+          <CaseDetail item={selected} onClose={() => setSelectedId(null)} onSave={handleUpdate} />
+        </Modal>
+      )}
+
+      {deleteTarget && (
+        <Modal title="確認刪除案件" onClose={() => setDeleteTargetId(null)}>
+          <div className="space-y-4">
+            <div className="flex items-start gap-3 rounded-lg border border-rose-200 bg-rose-50 p-3">
+              <AlertCircle size={18} className="text-rose-600 shrink-0 mt-0.5" />
+              <p className="text-sm text-rose-700 leading-relaxed">
+                確定要刪除「{deleteTarget.poName}（機號 {deleteTarget.machineNo}）」這筆案件嗎？
+                刪除後將無法復原，包含所有處理軌跡記錄。
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setDeleteTargetId(null)}
+                className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => handleDelete(deleteTarget.id)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-lg shadow-sm transition-colors"
+              >
+                <Trash2 size={15} />
+                確認刪除
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {importRows && (
+        <Modal
+          title="Excel 匯入預覽"
+          subtitle={`共讀取 ${importRows.length} 筆資料，將匯入 ${importRows.filter((r) => r.include).length} 筆，重複略過 ${importRows.filter((r) => r.duplicateOf).length} 筆，錯誤 ${importRows.filter((r) => !r.valid).length} 筆`}
+          onClose={() => setImportRows(null)}
+          wide
+        >
+          <div className="space-y-4">
+            <div className="rounded-xl border border-slate-200 overflow-hidden">
+              <div className="max-h-[50vh] overflow-y-auto">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-slate-50">
+                    <tr className="border-b border-slate-200 text-left">
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">匯入</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">列</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">結果</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">局名</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">局號</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">機號</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">廠商</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500">問題描述</th>
+                      <th className="px-3 py-2 font-semibold text-slate-500 whitespace-nowrap">狀態</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {importRows.map((r, i) => {
+                      const rowBg = !r.valid
+                        ? "bg-rose-50/60"
+                        : r.duplicateOf
+                        ? "bg-amber-50/60"
+                        : "";
+                      return (
+                        <tr key={i} className={`border-b border-slate-100 last:border-0 ${rowBg}`}>
+                          <td className="px-3 py-2 whitespace-nowrap">
+                            <input
+                              type="checkbox"
+                              checked={r.include}
+                              disabled={!r.valid}
+                              onChange={() => toggleImportRowInclude(r.rowIndex)}
+                              className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:opacity-40"
+                            />
+                          </td>
+                          <td className="px-3 py-2 whitespace-nowrap text-slate-400">#{r.rowIndex}</td>
+                          <td className="px-3 py-2 whitespace-nowrap">
+                            {!r.valid ? (
+                              <span className="inline-flex items-center gap-1 text-rose-600 font-medium" title={r.errors.join("；")}>
+                                <AlertCircle size={13} /> {r.errors.join("、")}
+                              </span>
+                            ) : r.duplicateOf ? (
+                              <span
+                                className="inline-flex items-center gap-1 text-amber-700 font-medium"
+                                title={r.duplicateOf === "system" ? "與系統中既有案件重複（局號＋機號＋發生時間相同）" : "與此檔案中另一列重複"}
+                              >
+                                <History size={13} />
+                                {r.duplicateOf === "system" ? "重複（系統已有）" : "重複（檔案內重複）"}
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                                <CheckCircle2 size={13} /> 可匯入
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 whitespace-nowrap text-slate-700">{r.poName || "—"}</td>
+                          <td className="px-3 py-2 whitespace-nowrap font-mono text-slate-500">{r.poCode || "—"}</td>
+                          <td className="px-3 py-2 whitespace-nowrap font-mono text-slate-500">{r.machineNo || "—"}</td>
+                          <td className="px-3 py-2 whitespace-nowrap text-slate-500">{r.vendor || "—"}</td>
+                          <td className="px-3 py-2 text-slate-600 max-w-xs truncate">{r.description || "—"}</td>
+                          <td className="px-3 py-2 whitespace-nowrap text-slate-500">{r.status}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-500 leading-relaxed">
+              系統會自動比對「局號＋機號＋問題發生時間」，若與現有案件或同檔案內其他列相同，會標示為橘色「重複」並預設不勾選匯入，
+              因此即使不清空匯入檔、每天重複上傳同一份累積資料，也不會建立重複案件。紅底列為格式錯誤，需修正 Excel 後重新上傳；
+              若您確認某筆「重複」其實是新案件，可勾選「匯入」欄位手動納入。
+            </p>
+
+            <div className="flex items-center justify-end gap-3 pt-2 border-t border-slate-100">
+              <button
+                onClick={() => setImportRows(null)}
+                className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleConfirmImport}
+                disabled={!importRows.some((r) => r.include)}
+                className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold rounded-lg shadow-sm transition-colors ${
+                  importRows.some((r) => r.include)
+                    ? "text-white bg-blue-700 hover:bg-blue-800"
+                    : "text-slate-400 bg-slate-200 cursor-not-allowed"
+                }`}
+              >
+                <Upload size={15} />
+                確認匯入 {importRows.filter((r) => r.include).length} 筆
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
