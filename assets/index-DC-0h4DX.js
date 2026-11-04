@@ -38581,12 +38581,12 @@ var Hy = (...e) =>
   Mb = `atm_case_tracker_v1`,
   Nb = `atm_case_tracker_sheet_url_v1`,
   Pb = `https://script.google.com/macros/s/AKfycbzG0kQxNygEXKEKYyY0MmOu2_sRj2dL2MJTl_17N7a4GeuybU-GhLkVJoOf8AKn3eOudg/exec`,
-  Fb = [`DN200AT`, `DN100D`, `PC280`, `SR7500`, `MX8600ST`, `RG7`, `其他`],
+  Fb = [`DN200AT`, `DN100D`, `PC280`, `PC280NT`, `PC280N`, `PC280T`, `SR7500`, `MX8600ST`, `RG7`, `其他`],
   Ib = [`三商`, `國眾`, `迪堡多富`],
   Lb = {
     三商: [`SR7500`],
     國眾: [`MX8600ST`, `RG7`],
-    迪堡多富: [`DN100D`, `DN200AT`, `PC280`],
+    迪堡多富: [`DN100D`, `DN200AT`, `PC280`, `PC280NT`, `PC280N`, `PC280T`],
   };
 function Rb(e) {
   let t = Lb[e];
@@ -39727,7 +39727,126 @@ function atmNormTime(v) {
     ? s
     : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
-function atmJsonToRows(text) {
+// ----- 機台主檔（局號＋機號 → 局名、機種）-----
+var ATM_MASTER_LS = `atm_machine_master_v1`;
+function atmNormName(e) {
+  return String(e || ``)
+    .replace(/\s/g, ``)
+    .replace(/臺/g, `台`)
+    .replace(/郵局$/, ``);
+}
+function atmBuildMaster(rows, meta) {
+  let byKey = new Map(),
+    byPo = new Map(),
+    names = new Map();
+  rows.forEach((r) => {
+    let m = {
+      poCode: Qb(Zb(r[0]), 6),
+      poName: String(r[1] || ``).trim(),
+      machineNo: String(r[2] || ``).trim().toUpperCase(),
+      machineType: String(r[3] || ``).trim().toUpperCase(),
+    };
+    if (!m.poCode || !m.machineNo) return;
+    byKey.set(`${m.poCode}-${m.machineNo}`, m);
+    byPo.has(m.poCode) || byPo.set(m.poCode, []);
+    byPo.get(m.poCode).push(m);
+    names.set(atmNormName(m.poName), m.poCode);
+  });
+  return { byKey, byPo, names, count: byKey.size, ...(meta || {}) };
+}
+function atmFindPoByName(master, name) {
+  let n = atmNormName(name);
+  if (!master || !n) return ``;
+  if (master.names.has(n)) return master.names.get(n);
+  let hits = [...master.names.entries()].filter(
+    ([k]) => k.length >= 2 && (k.includes(n) || n.includes(k)),
+  );
+  return hits.length === 1 ? hits[0][1] : ``;
+}
+function atmVendorOf(type) {
+  return Object.keys(Lb).find((k) => Lb[k].includes(type)) || ``;
+}
+// 依主檔補齊欄位；changed = 使用者剛修改的欄位（初次建立時為 null）
+function atmApplyMaster(f, master, changed) {
+  let o = { ...f },
+    note = ``;
+  if (!master) return { fields: o, note };
+  o.poCode = Qb(Zb(o.poCode), 6);
+  o.machineNo = String(o.machineNo || ``).trim().toUpperCase();
+  if (!o.poCode && o.poName && (!changed || changed === `poName`)) {
+    let p = atmFindPoByName(master, o.poName);
+    p && ((o.poCode = p), (note = `依局名帶入局號`));
+  }
+  let list = master.byPo.get(o.poCode) || [];
+  if (o.poCode && !o.machineNo && list.length === 1 && (!changed || changed === `poCode` || changed === `poName`))
+    o.machineNo = list[0].machineNo;
+  let m = master.byKey.get(`${o.poCode}-${o.machineNo}`);
+  if (m && (!changed || changed === `poCode` || changed === `machineNo` || changed === `poName`)) {
+    ((o.poName = m.poName), (o.machineType = m.machineType));
+    let v = atmVendorOf(m.machineType);
+    v && (o.vendor = v);
+    note = note ? note + `、局名／機種` : `已依主檔帶入局名／機種`;
+  }
+  return { fields: o, note, hit: !!m, options: list };
+}
+function atmBuildRow(fields, idx, master, changed, extra) {
+  let r0 = atmApplyMaster(fields, master, changed),
+    f = r0.fields;
+  if (!Ib.includes(f.vendor)) {
+    let v = atmVendorOf(String(f.machineType || ``).toUpperCase());
+    v && (f.vendor = v);
+  }
+  let row = tx(
+      {
+        郵局局名: f.poName,
+        局號: f.poCode,
+        機號: f.machineNo,
+        機種: String(f.machineType || ``).toUpperCase(),
+        廠商名稱: f.vendor,
+        問題發生時間點: f.issueTime,
+        問題描述: f.description,
+        廠商分析: f.vendorAnalysis,
+        解決時間: f.resolveTime,
+        解決方法: f.solution,
+        目前狀態: f.status,
+      },
+      idx,
+    ),
+    errs = [...row.errors];
+  Ib.includes(row.vendor) || errs.push(`缺少廠商`);
+  return {
+    ...(extra || {}),
+    ...row,
+    fields: { ...f, status: row.status },
+    errors: errs,
+    valid: errs.length === 0,
+    source: `json`,
+    masterHit: r0.hit,
+    masterNote: master
+      ? r0.hit
+        ? r0.note
+        : !row.poCode
+          ? `主檔找不到此局名，請補填局號`
+          : !row.machineNo && (r0.options || []).length
+            ? `此局有 ${r0.options.length} 台機台，請補填機號`
+            : `主檔查無「${row.poCode}-${row.machineNo || `?`}」，請確認局號／機號`
+      : ``,
+    machineOptions: r0.options || [],
+  };
+}
+// 重新比對重複；editedIdx 指定的列依結果重設勾選
+function atmRecheck(rows, cases, editedIdx) {
+  let o = new Set(cases.map(nx)),
+    s = new Set();
+  return rows.map((e) => {
+    let t = nx(e),
+      n = o.has(t) ? `system` : s.has(t) ? `batch` : null;
+    e.valid && s.add(t);
+    let inc = e.rowIndex === editedIdx || e.include === void 0 ? e.valid && !n : e.include && e.valid;
+    return { ...e, duplicateOf: n, include: inc };
+  });
+}
+function atmJsonToRows(text, master) {
   let s = String(text || ``)
     .replace(/```(?:json)?/gi, ``)
     .trim();
@@ -39742,37 +39861,23 @@ function atmJsonToRows(text) {
   if (!list.length) throw Error(`JSON 中沒有案件資料`);
   return list.map((o, i) => {
     o = o || {};
-    let g = (en, zh) => (o[en] !== void 0 && o[en] !== null ? o[en] : o[zh] !== void 0 && o[zh] !== null ? o[zh] : ``),
-      type = String(g(`machineType`, `機種`)).trim().toUpperCase(),
-      vendor = String(g(`vendor`, `廠商名稱`)).trim();
-    if (!Ib.includes(vendor)) {
-      let k = Object.keys(Lb).find((k) => Lb[k].includes(type));
-      k && (vendor = k);
-    }
-    let row = tx(
-        {
-          郵局局名: g(`poName`, `郵局局名`),
-          局號: g(`poCode`, `局號`),
-          機號: g(`machineNo`, `機號`),
-          機種: type,
-          廠商名稱: vendor,
-          問題發生時間點: atmNormTime(g(`issueTime`, `問題發生時間點`)),
-          問題描述: g(`description`, `問題描述`),
-          廠商分析: g(`vendorAnalysis`, `廠商分析`),
-          解決時間: atmNormTime(g(`resolveTime`, `解決時間`)),
-          解決方法: g(`solution`, `解決方法`),
-          目前狀態: g(`status`, `目前狀態`),
-        },
-        i + 1,
-      ),
-      errs = [...row.errors];
-    Ib.includes(row.vendor) || errs.push(`廠商需為 ${Ib.join(`/`)}`);
-    let logs = Array.isArray(o.logs) ? o.logs : [];
-    return {
-      ...row,
-      errors: errs,
-      valid: errs.length === 0,
-      source: `json`,
+    let g = (en, zh) =>
+        String(o[en] !== void 0 && o[en] !== null ? o[en] : o[zh] !== void 0 && o[zh] !== null ? o[zh] : ``).trim(),
+      fields = {
+        poName: g(`poName`, `郵局局名`),
+        poCode: g(`poCode`, `局號`),
+        machineNo: g(`machineNo`, `機號`).toUpperCase(),
+        machineType: g(`machineType`, `機種`).toUpperCase(),
+        vendor: g(`vendor`, `廠商名稱`),
+        issueTime: atmNormTime(g(`issueTime`, `問題發生時間點`)),
+        description: g(`description`, `問題描述`),
+        vendorAnalysis: g(`vendorAnalysis`, `廠商分析`),
+        resolveTime: atmNormTime(g(`resolveTime`, `解決時間`)),
+        solution: g(`solution`, `解決方法`),
+        status: g(`status`, `目前狀態`),
+      },
+      logs = Array.isArray(o.logs) ? o.logs : [];
+    return atmBuildRow(fields, i + 1, master, null, {
       extraLogs: logs
         .filter((l) => l && l.note)
         .map((l) => {
@@ -39780,11 +39885,84 @@ function atmJsonToRows(text) {
           return {
             id: Wb(),
             time: isNaN(t.getTime()) ? new Date().toISOString() : t.toISOString(),
-            status: Hb.includes(l.status) ? l.status : row.status,
+            status: Hb.includes(l.status) ? l.status : Vb.PENDING,
             note: String(l.note),
           };
         }),
-    };
+    });
+  });
+}
+// ----- 預覽畫面：補填／修改欄位 -----
+function atmEditPanel({ row: r, onChange: ch, master: M }) {
+  let inp = (k, label, opt) =>
+      (0, Q.jsx)(sx, {
+        label,
+        required: opt && opt.req,
+        children: (0, Q.jsx)(`input`, {
+          className: cx,
+          type: (opt && opt.type) || `text`,
+          list: opt && opt.list,
+          value: r.fields[k] || ``,
+          onChange: (e) => ch(k, e.target.value),
+        }),
+      }),
+    sel = (k, label, opts, req) =>
+      (0, Q.jsx)(sx, {
+        label,
+        required: req,
+        children: (0, Q.jsxs)(`select`, {
+          className: cx,
+          value: r.fields[k] || ``,
+          onChange: (e) => ch(k, e.target.value),
+          children: [
+            (0, Q.jsx)(`option`, { value: ``, children: `請選擇` }),
+            ...opts.map((o) => (0, Q.jsx)(`option`, { value: o, children: o }, o)),
+          ],
+        }),
+      }),
+    area = (k, label, req) =>
+      (0, Q.jsx)(sx, {
+        label,
+        required: req,
+        children: (0, Q.jsx)(`textarea`, {
+          className: `${cx} resize-y`,
+          rows: 2,
+          value: r.fields[k] || ``,
+          onChange: (e) => ch(k, e.target.value),
+        }),
+      }),
+    listId = `atm-mno-${r.rowIndex}`,
+    types = [...new Set([...Fb.filter((e) => e !== `其他`), ...Object.values(Lb).flat(), `其他`])];
+  return (0, Q.jsxs)(`div`, {
+    className: `grid grid-cols-1 sm:grid-cols-2 gap-3`,
+    children: [
+      inp(`poCode`, `局號（6碼）`, { req: !0 }),
+      inp(`machineNo`, `機號（3碼）`, { req: !0, list: listId }),
+      (0, Q.jsx)(`datalist`, {
+        id: listId,
+        children: (r.machineOptions || []).map((m) =>
+          (0, Q.jsx)(`option`, { value: m.machineNo, children: m.machineType }, m.machineNo),
+        ),
+      }),
+      inp(`poName`, `郵局局名`, { req: !0 }),
+      sel(`status`, `目前狀態`, Hb, !0),
+      sel(`machineType`, `機種`, types),
+      sel(`vendor`, `廠商`, Ib, !0),
+      inp(`issueTime`, `問題發生時間`, { req: !0, type: `datetime-local` }),
+      inp(`resolveTime`, `解決時間／預期解決時間`, { type: `datetime-local` }),
+      (0, Q.jsx)(`div`, { style: { gridColumn: `1 / -1` }, children: area(`description`, `問題描述`, !0) }),
+      area(`vendorAnalysis`, `廠商分析`),
+      area(`solution`, `解決方法`),
+      (r.machineOptions || []).length > 0 &&
+        (0, Q.jsxs)(`p`, {
+          className: `text-xs text-slate-500`,
+          style: { gridColumn: `1 / -1` },
+          children: [
+            `此局主檔機台：`,
+            r.machineOptions.map((m) => `${m.machineNo}（${m.machineType}）`).join(`、`),
+          ],
+        }),
+    ],
   });
 }
 // ===== 新增：同一台機器故障頻率 =====
@@ -39906,7 +40084,7 @@ function atmFreqView({ items: e, onOpen: t }) {
                           {
                             onClick: () => setOpen(open === s.key ? null : s.key),
                             title: `點擊展開此機台的歷次案件`,
-                            className: `border-b border-slate-100 cursor-pointer transition-colors ${hot ? `bg-rose-50 hover:bg-rose-100` : `hover:bg-slate-50`}`,
+                            className: `border-b border-slate-100 cursor-pointer transition-colors ${hot ? `bg-rose-50 hover:bg-rose-50` : `hover:bg-slate-50`}`,
                             children: [
                               (0, Q.jsxs)(`td`, {
                                 className: `${td} font-mono text-slate-700`,
@@ -40016,7 +40194,26 @@ function _x() {
     [I, L] = (0, _.useState)(`idle`),
     [atmJOpen, atmSetJOpen] = (0, _.useState)(!1),
     [atmJText, atmSetJText] = (0, _.useState)(``),
-    [atmJErr, atmSetJErr] = (0, _.useState)(``);
+    [atmJErr, atmSetJErr] = (0, _.useState)(``),
+    [atmMaster, atmSetMaster] = (0, _.useState)(null),
+    [atmEditIdx, atmSetEditIdx] = (0, _.useState)(null),
+    atmMasterInput = (0, _.useRef)(null);
+  (0, _.useEffect)(() => {
+    try {
+      let s = localStorage.getItem(ATM_MASTER_LS);
+      if (s) {
+        let j = JSON.parse(s);
+        atmSetMaster(atmBuildMaster(j.rows, { source: `上傳`, updatedAt: j.updatedAt }));
+        return;
+      }
+    } catch {}
+    fetch(new URL(`./machines.json`, import.meta.url))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        j && j.rows && atmSetMaster(atmBuildMaster(j.rows, { source: `內建`, updatedAt: j.updatedAt }));
+      })
+      .catch(() => {});
+  }, []);
   ((0, _.useEffect)(() => {
     t(ox());
   }, []),
@@ -40173,21 +40370,44 @@ function _x() {
         t.map((t) => (t.rowIndex === e ? { ...t, include: !t.include } : t)),
       );
     },
+    atmEditRow = (idx, k, v) => {
+      S((rows) =>
+        atmRecheck(
+          rows.map((r) =>
+            r.rowIndex === idx
+              ? atmBuildRow({ ...r.fields, [k]: v }, idx, atmMaster, k, { extraLogs: r.extraLogs })
+              : r,
+          ),
+          e,
+          idx,
+        ),
+      );
+    },
+    atmUploadMaster = async (ev) => {
+      let f = ev.target.files && ev.target.files[0];
+      if (((ev.target.value = ``), !f)) return;
+      try {
+        let wb = dy(await f.arrayBuffer(), { type: `array` }),
+          rows = Vy.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: ``, raw: !1 })
+            .map((r) => [r[`局號`], r[`局名`], r[`機號`], r[`機種`]])
+            .filter((r) => r[0] && r[2]);
+        if (!rows.length) throw Error(`找不到「局號／局名／機號／機種」欄位`);
+        let d = new Date().toISOString().slice(0, 10);
+        try {
+          localStorage.setItem(ATM_MASTER_LS, JSON.stringify({ updatedAt: d, rows }));
+        } catch {}
+        (atmSetMaster(atmBuildMaster(rows, { source: `上傳`, updatedAt: d })), atmSetJErr(``));
+      } catch (err) {
+        atmSetJErr(`機台主檔讀取失敗：` + (err.message || err));
+      }
+    },
     atmImportJson = () => {
       try {
-        let a = atmJsonToRows(atmJText),
+        let a = atmJsonToRows(atmJText, atmMaster),
           o = new Set(e.map(nx)),
           s = new Set(),
-          c = a.map((e) => {
-            let t = nx(e),
-              n = null;
-            return (
-              o.has(t) ? (n = `system`) : s.has(t) && (n = `batch`),
-              e.valid && s.add(t),
-              { ...e, duplicateOf: n, include: e.valid && !n }
-            );
-          });
-        (atmSetJErr(``), atmSetJOpen(!1), atmSetJText(``), S(c));
+          c = atmRecheck(a, e, null);
+        (atmSetJErr(``), atmSetJOpen(!1), atmSetJText(``), atmSetEditIdx(null), S(c));
       } catch (err) {
         atmSetJErr(err.message || String(err));
       }
@@ -41020,6 +41240,29 @@ function _x() {
                   (atmSetJText(e.target.value), atmSetJErr(``));
                 },
               }),
+              (0, Q.jsxs)(`div`, {
+                className: `flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2`,
+                children: [
+                  (0, Q.jsx)(`p`, {
+                    className: `text-xs text-slate-600`,
+                    children: atmMaster
+                      ? `機台主檔：${atmMaster.count.toLocaleString()} 台（${atmMaster.source}${atmMaster.updatedAt ? `，${atmMaster.updatedAt}` : ``}）。匯入時會依「局號＋機號」自動帶入局名、機種、廠商；只有局名時會反查局號。`
+                      : `機台主檔載入中或未設定，將不會自動帶入局名／機種。`,
+                  }),
+                  (0, Q.jsx)(`input`, {
+                    ref: atmMasterInput,
+                    type: `file`,
+                    accept: `.xls,.xlsx,.csv`,
+                    className: `hidden`,
+                    onChange: atmUploadMaster,
+                  }),
+                  (0, Q.jsx)(`button`, {
+                    onClick: () => atmMasterInput.current && atmMasterInput.current.click(),
+                    className: `px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors`,
+                    children: `更新機台主檔`,
+                  }),
+                ],
+              }),
               atmJErr &&
                 (0, Q.jsxs)(`p`, {
                   className: `text-xs font-medium text-rose-600 flex items-center gap-1`,
@@ -41052,7 +41295,7 @@ function _x() {
         (0, Q.jsx)(mx, {
           title: x.some((e) => e.source === `json`) ? `JSON 匯入預覽` : `Excel 匯入預覽`,
           subtitle: `共讀取 ${x.length} 筆資料，將匯入 ${x.filter((e) => e.include).length} 筆，重複略過 ${x.filter((e) => e.duplicateOf).length} 筆，錯誤 ${x.filter((e) => !e.valid).length} 筆`,
-          onClose: () => S(null),
+          onClose: () => (S(null), atmSetEditIdx(null)),
           wide: !0,
           children: (0, Q.jsxs)(`div`, {
             className: `space-y-4`,
@@ -41060,7 +41303,7 @@ function _x() {
               (0, Q.jsx)(`div`, {
                 className: `rounded-xl border border-slate-200 overflow-hidden`,
                 children: (0, Q.jsx)(`div`, {
-                  className: `max-h-[50vh] overflow-y-auto`,
+                  className: `max-h-[50vh] overflow-y-auto overflow-x-auto`,
                   children: (0, Q.jsxs)(`table`, {
                     className: `w-full text-xs`,
                     children: [
@@ -41109,7 +41352,7 @@ function _x() {
                         }),
                       }),
                       (0, Q.jsx)(`tbody`, {
-                        children: x.map((e, t) =>
+                        children: x.flatMap((e, t) => [
                           (0, Q.jsxs)(
                             `tr`,
                             {
@@ -41131,7 +41374,16 @@ function _x() {
                                 }),
                                 (0, Q.jsx)(`td`, {
                                   className: `px-3 py-2 whitespace-nowrap`,
-                                  children: e.valid
+                                  children: (0, Q.jsxs)(`div`, {
+                                    className: `flex items-center gap-2`,
+                                    children: [
+                                      e.source === `json` &&
+                                        (0, Q.jsx)(`button`, {
+                                          onClick: () => atmSetEditIdx(atmEditIdx === e.rowIndex ? null : e.rowIndex),
+                                          className: `px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${atmEditIdx === e.rowIndex ? `bg-blue-700 text-white` : e.valid ? `border border-slate-300 text-slate-600 hover:bg-slate-100` : `bg-rose-600 text-white hover:bg-rose-700`}`,
+                                          children: atmEditIdx === e.rowIndex ? `收合` : e.valid ? `編輯` : `補填`,
+                                        }),
+                                      e.valid
                                     ? e.duplicateOf
                                       ? (0, Q.jsxs)(`span`, {
                                           className: `inline-flex items-center gap-1 text-amber-700 font-medium`,
@@ -41162,6 +41414,8 @@ function _x() {
                                           e.errors.join(`、`),
                                         ],
                                       }),
+                                    ],
+                                  }),
                                 }),
                                 (0, Q.jsx)(`td`, {
                                   className: `px-3 py-2 whitespace-nowrap text-slate-700`,
@@ -41191,7 +41445,42 @@ function _x() {
                             },
                             t,
                           ),
-                        ),
+                          e.source === `json` &&
+                            e.masterNote &&
+                            atmEditIdx !== e.rowIndex &&
+                            (0, Q.jsx)(
+                              `tr`,
+                              {
+                                className: `border-b border-slate-100`,
+                                children: (0, Q.jsx)(`td`, {
+                                  colSpan: 10,
+                                  className: `px-3 py-1 text-xs ${e.masterHit ? `text-emerald-700` : `text-amber-700`}`,
+                                  children: (e.masterHit ? `✓ ` : `⚠ `) + e.masterNote,
+                                }),
+                              },
+                              t + `-m`,
+                            ),
+                          atmEditIdx === e.rowIndex &&
+                            (0, Q.jsx)(
+                              `tr`,
+                              {
+                                className: `border-b border-slate-200 bg-blue-50/50`,
+                                children: (0, Q.jsx)(`td`, {
+                                  colSpan: 10,
+                                  className: `px-4 py-4`,
+                                  children: (0, Q.jsx)(`div`, {
+                                    style: { position: `sticky`, left: `16px`, maxWidth: `40rem` },
+                                    children: (0, Q.jsx)(atmEditPanel, {
+                                      row: e,
+                                      master: atmMaster,
+                                      onChange: (k, v) => atmEditRow(e.rowIndex, k, v),
+                                    }),
+                                  }),
+                                }),
+                              },
+                              t + `-e`,
+                            ),
+                        ]),
                       }),
                     ],
                   }),
