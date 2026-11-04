@@ -39984,14 +39984,16 @@ function atmFreqStats(items, windowDays) {
       let n = m.cases.length,
         last = m.cases[0],
         first = m.cases[n - 1],
-        cnt = (d) => m.cases.filter((c) => c._t >= now - d * DAY).length;
+        cnt = (d) => m.cases.filter((c) => c._t >= now - d * DAY && c._t <= now).length,
+        windowCases = m.cases.filter((c) => c._t >= now - windowDays * DAY && c._t <= now);
       return {
         ...m,
         poName: last.poName,
         machineType: last.machineType,
         vendor: last.vendor,
         total: n,
-        inWindow: cnt(windowDays),
+        inWindow: windowCases.length,
+        windowCases,
         last30: cnt(30),
         open: m.cases.filter((c) => c.status !== Vb.CLOSED).length,
         lastTime: last.issueTime,
@@ -40001,7 +40003,42 @@ function atmFreqStats(items, windowDays) {
     })
     .sort((a, b) => b.inWindow - a.inWindow || b.total - a.total || b.cases[0]._t - a.cases[0]._t);
 }
-function atmFreqView({ items: e, onOpen: t }) {
+function atmFreqExport(stats, windowDays, threshold, filters) {
+  const frequent = stats.filter((s) => s.inWindow >= threshold);
+  const detail = frequent.flatMap((s) => s.windowCases.map((c) => ({
+    局號: String(s.poCode), 局名: c.poName || s.poName || ``, 機號: String(s.machineNo),
+    機種: c.machineType || ``, 廠商: c.vendor || ``, [`近${windowDays}天故障次數`]: s.inWindow,
+    故障時間: qb(c.issueTime), 問題描述: c.description || ``, 廠商分析: c.vendorAnalysis || ``,
+    處理狀態: c.status || ``, 解決時間: qb(c.resolveTime), 解決方法: c.solution || ``,
+  })));
+  if (!detail.length) return;
+  const vendors = [...new Set(detail.map((c) => c.廠商 || `未填寫廠商`))];
+  if (vendors.length > 1 && !window.confirm(`匯出資料包含多個廠商：${vendors.join(`、`)}。如要交給單一廠商，請取消並先用上方「廠商」篩選。仍要匯出嗎？`)) return;
+  const sheet = Vy.json_to_sheet(detail);
+  sheet[`!cols`] = [12, 18, 12, 16, 14, 16, 22, 45, 45, 16, 22, 45].map((wch) => ({wch}));
+  sheet[`!autofilter`] = {ref: `A1:L${detail.length + 1}`};
+  const now = new Date();
+  const taiwanTime = new Intl.DateTimeFormat(`sv-SE`, {timeZone: `Asia/Taipei`, year:`numeric`, month:`2-digit`, day:`2-digit`, hour:`2-digit`, minute:`2-digit`, second:`2-digit`, hour12: false}).format(now);
+  const info = Vy.aoa_to_sheet([
+    [`報表說明`, `內容`],
+    [`產生時間（台灣時間）`, taiwanTime],
+    [`統計條件`, `近 ${windowDays} 天內故障至少 ${threshold} 次，以局號＋機號判定同一台。`],
+    [`明細範圍`, `僅列出符合門檻機台在統計期間內的案件；不含更早或未來的案件。`],
+    [`時間定義`, `以產生前 ${windowDays} × 24 小時為期間，含起迄時間；故障時間依系統原記錄顯示。`],
+    [`搜尋文字`, filters.search || `（未輸入）`],
+    [`狀態篩選`, filters.statuses.join(`、`) || `（未選擇）`],
+    [`廠商篩選`, filters.vendors.join(`、`) || `（未選擇）`],
+    [`機台數`, frequent.length], [`案件數`, detail.length],
+    [`原因欄位說明`, `問題描述及廠商分析依系統記錄列出；空白代表尚未填寫，不代表已確認根因。`],
+    [`使用提醒`, `篩選會影響故障次數及清單；交付前請確認廠商及內容。`],
+  ]);
+  info[`!cols`] = [{wch: 24}, {wch: 95}];
+  const book = Vy.book_new();
+  Vy.book_append_sheet(book, sheet, `故障明細`);
+  Vy.book_append_sheet(book, info, `報表說明`);
+  xy(book, `ATM頻繁故障明細_${taiwanTime.slice(0,10)}.xlsx`);
+}
+function atmFreqView({ items: e, onOpen: t, filters }) {
   let [w, setW] = (0, _.useState)(90),
     [th, setTh] = (0, _.useState)(2),
     [only, setOnly] = (0, _.useState)(!1),
@@ -40046,6 +40083,13 @@ function atmFreqView({ items: e, onOpen: t }) {
                 children: [2, 3, 4].map((n) =>
                   (0, Q.jsx)(`button`, { onClick: () => setTh(n), className: btn(th === n), children: `≥${n}次` }, n),
                 ),
+              }),
+              (0, Q.jsx)(`button`, {
+                onClick: () => atmFreqExport(atmFreqStats(e, w), w, th, filters),
+                disabled: !repeatCount,
+                title: `匯出符合門檻的機台在所選期間內的故障明細`,
+                className: `px-3 py-1.5 rounded-lg text-xs font-semibold ${repeatCount ? `bg-emerald-600 text-white hover:bg-emerald-700` : `bg-slate-200 text-slate-400 cursor-not-allowed`}`,
+                children: `匯出頻繁故障 Excel`,
               }),
               (0, Q.jsx)(`button`, {
                 onClick: () => setOnly((v) => !v),
@@ -40743,7 +40787,7 @@ function _x() {
             ],
           }),
           f === `freq`
-            ? (0, Q.jsx)(atmFreqView, { items: V, onOpen: (e) => a(e) })
+            ? (0, Q.jsx)(atmFreqView, { items: V, onOpen: (e) => a(e), filters: { search: o, statuses: c, vendors: u } })
             : V.length === 0
             ? (0, Q.jsxs)(`div`, {
                 className: `text-center py-16 rounded-xl border border-dashed border-slate-300 bg-white`,
